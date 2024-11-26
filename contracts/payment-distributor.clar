@@ -1,99 +1,134 @@
 ;; payment-distributor.clar
-;; Advanced payment distribution and reward system for the advertising platform
-;; Version: 2.0.0
+;; Complete payment distribution system with advanced security and validation
+;; Version: 1.0.0
 
 ;; ============================================
-;; Constants and Error Codes
+;; Error Codes
 ;; ============================================
+(define-constant ERR-not-authorized (err u401))
+(define-constant ERR-invalid-params (err u400))
+(define-constant ERR-not-found (err u404))
+(define-constant ERR-insufficient-funds (err u405))
+(define-constant ERR-claim-expired (err u406))
+(define-constant ERR-already-claimed (err u407))
+(define-constant ERR-pool-expired (err u408))
+(define-constant ERR-invalid-amount (err u409))
+(define-constant ERR-pool-inactive (err u410))
+(define-constant ERR-daily-limit-exceeded (err u411))
+(define-constant ERR-blacklisted (err u412))
+(define-constant ERR-rate-limit-exceeded (err u413))
+(define-constant ERR-invalid-status (err u414))
+(define-constant ERR-zero-amount (err u415))
 
-(define-constant CONTRACT_OWNER tx-sender)
-(define-constant ERR_NOT_AUTHORIZED (err u401))
-(define-constant ERR_INVALID_PARAMS (err u400))
-(define-constant ERR_NOT_FOUND (err u404))
-(define-constant ERR_INSUFFICIENT_FUNDS (err u405))
-(define-constant ERR_PAYMENT_FAILED (err u406))
-(define-constant ERR_INVALID_AMOUNT (err u407))
-(define-constant ERR_ALREADY_CLAIMED (err u408))
-(define-constant ERR_NOT_ELIGIBLE (err u409))
-(define-constant ERR_DISTRIBUTION_LOCKED (err u410))
+;; ============================================
+;; Constants
+;; ============================================
+(define-constant contract-owner tx-sender)
+(define-constant platform-fee u2)
+(define-constant min-pool-amount u1000000)    ;; 1 STX
+(define-constant claim-duration u144)         ;; ~1 day in blocks
+(define-constant max-daily-claims u5)
+(define-constant max-amount-per-tx u1000000000)  ;; 1000 STX
+(define-constant min-amount-per-tx u1000000)     ;; 1 STX
+(define-constant max-daily-amount u100000000000) ;; 100,000 STX
 
 ;; ============================================
 ;; Data Variables
 ;; ============================================
-
-(define-data-var platform-fee-percent uint u2)    
-(define-data-var min-payout-amount uint u1000000) 
-(define-data-var total-distributed uint u0)        
-(define-data-var distribution-nonce uint u0)       
-(define-data-var treasury-balance uint u0)         
-(define-data-var pool-counter uint u0)            
+(define-data-var treasury-balance uint u0)
+(define-data-var payment-counter uint u0)
+(define-data-var pool-counter uint u0)
+(define-data-var contract-paused bool false)
+(define-data-var total-volume uint u0)
+(define-data-var total-fees-collected uint u0)
 
 ;; ============================================
 ;; Data Maps
 ;; ============================================
 
-(define-map distributions 
-    { id: uint }
-    {
-        recipient: principal,
-        amount: uint,
-        campaign-id: uint,
-        block-height: uint,
-        status: (string-ascii 20),
-        fee-amount: uint,
-        proof: (buff 32)
+;; Security Maps
+(define-map blacklisted-addresses
+    { address: principal }
+    { 
+        blacklisted: bool, 
+        reason: (string-ascii 50),
+        blacklisted-at: uint
     }
 )
 
+(define-map daily-limits
+    { address: principal, day: uint }
+    { 
+        tx-count: uint, 
+        total-amount: uint,
+        last-tx-height: uint
+    }
+)
+
+;; Core Payment Maps
 (define-map publisher-accounts
     { publisher: principal }
     {
         balance: uint,
         total-earned: uint,
-        last-payout-height: uint,
-        payout-address: (optional principal),
-        payment-schedule: (string-ascii 10),
-        auto-payout: bool,
-        min-payout: uint
+        reward-points: uint,
+        tier: (string-ascii 10),
+        last-activity: uint,
+        total-claims: uint,
+        pending-claims: uint,
+        status: (string-ascii 10)
+    }
+)
+
+(define-map payments
+    { payment-id: uint }
+    {
+        sender: principal,
+        recipient: principal,
+        amount: uint,
+        fee: uint,
+        net-amount: uint,
+        timestamp: uint,
+        status: (string-ascii 20),
+        memo: (optional (string-ascii 100))
     }
 )
 
 (define-map revenue-pools
-    { id: uint }
+    { pool-id: uint }
     {
         total-amount: uint,
-        participants: uint,
-        share-price: uint,
+        remaining-amount: uint,
         start-height: uint,
         end-height: uint,
-        status: (string-ascii 20),
-        distribution-type: (string-ascii 20)
+        participants: uint,
+        min-claim: uint,
+        max-claim: uint,
+        creator: principal,
+        status: (string-ascii 10),
+        pool-type: (string-ascii 20)
     }
 )
 
-(define-map reward-points
-    { publisher: principal }
+(define-map pool-participants
+    { pool-id: uint, participant: principal }
     {
-        points: uint,
-        tier: (string-ascii 10),
-        multiplier: uint,
-        last-updated: uint,
-        history: (list 10 {
-            action: (string-ascii 20),
-            amount: uint,
-            block-height: uint
-        })
+        total-claimed: uint,
+        last-claim: uint,
+        claims-count: uint
     }
 )
 
 (define-map payment-claims
-    { id: (buff 32) }
+    { claim-id: uint }
     {
         publisher: principal,
+        pool-id: uint,
         amount: uint,
-        status: (string-ascii 20),
-        expiry-height: uint,
-        claimed: bool
+        created-at: uint,
+        expires-at: uint,
+        status: (string-ascii 10),
+        processed-at: (optional uint)
     }
 )
 
@@ -101,269 +136,112 @@
 ;; Private Functions
 ;; ============================================
 
-(define-private (calculate-platform-fee (amount uint))
-    (/ (* amount (var-get platform-fee-percent)) u100)
+;; Basic Checks
+(define-private (is-owner)
+    (is-eq tx-sender contract-owner)
 )
 
-(define-private (is-contract-owner)
-    (is-eq tx-sender CONTRACT_OWNER)
+(define-private (is-contract-active)
+    (not (var-get contract-paused))
 )
 
-(define-private (generate-distribution-id)
-    (let 
-        ((current-nonce (var-get distribution-nonce)))
-        (var-set distribution-nonce (+ current-nonce u1))
-        current-nonce
-    )
+;; Calculations
+(define-private (calculate-fee (amount uint))
+    (/ (* amount platform-fee) u100)
 )
 
+;; Validation Functions
 (define-private (validate-amount (amount uint))
     (and 
         (> amount u0)
-        (>= amount (var-get min-payout-amount))
+        (>= amount min-amount-per-tx)
+        (<= amount max-amount-per-tx)
     )
 )
 
-(define-private (create-reward-history-entry (amount uint))
-    {
-        action: "earn",
-        amount: amount,
-        block-height: block-height
-    }
-)
-
-(define-private (determine-reward-tier (points uint))
-    (if (>= points u1000000)
-        "platinum"
-        (if (>= points u500000)
-            "gold"
-            (if (>= points u100000)
-                "silver"
-                "bronze"
-            )
-        )
+(define-private (check-blacklist (address principal))
+    (match (map-get? blacklisted-addresses { address: address })
+        blacklist-data (not (get blacklisted blacklist-data))
+        true
     )
 )
 
-(define-private (get-tier-multiplier (tier (string-ascii 10)))
-    (if (is-eq tier "platinum")
-        u20
-        (if (is-eq tier "gold")
-            u15
-            (if (is-eq tier "silver")
-                u12
-                u10
-            )
-        )
-    )
-)
-
-(define-private (update-publisher-balance (publisher principal) (amount uint))
+(define-private (check-daily-limit (address principal) (amount uint))
     (let 
-        ((account (unwrap! (map-get? publisher-accounts { publisher: publisher }) false)))
+        ((current-day (/ block-height u144))
+         (limit-data (default-to 
+            { tx-count: u0, total-amount: u0, last-tx-height: u0 } 
+            (map-get? daily-limits { address: address, day: current-day }))))
         
-            (map-set publisher-accounts
-                { publisher: publisher }
-                (merge account {
-                    balance: (+ (get balance account) amount),
-                    total-earned: (+ (get total-earned account) amount)
-                })
-            )
-        
-    )
-)
-
-(define-private (calculate-reward-points (amount uint))
-    (/ amount u1000000)
-)
-
-(define-private (update-reward-points (publisher principal) (points uint))
-    (let 
-        ((history-entry (create-reward-history-entry points)))
-        (match (map-get? reward-points { publisher: publisher })
-            existing-data 
-            (ok 
-                (map-set reward-points
-                    { publisher: publisher }
-                    {
-                        points: (+ (get points existing-data) points),
-                        tier: (determine-reward-tier (+ (get points existing-data) points)),
-                        multiplier: (get-tier-multiplier (determine-reward-tier (+ (get points existing-data) points))),
-                        last-updated: block-height,
-                        history: (unwrap! 
-                            (as-max-len? 
-                                (append 
-                                    (list history-entry) 
-                                    (get history existing-data)
-                                ) 
-                                u10
-                            )
-                            (list history-entry)
-                        )
-                    }
-                )
-            )
-            (ok 
-                (map-set reward-points
-                    { publisher: publisher }
-                    {
-                        points: points,
-                        tier: (determine-reward-tier points),
-                        multiplier: (get-tier-multiplier (determine-reward-tier points)),
-                        last-updated: block-height,
-                        history: (list history-entry)
-                    }
-                )
-            )
+        (and
+            (<= (+ (get total-amount limit-data) amount) max-daily-amount)
+            (<= (get tx-count limit-data) max-daily-claims)
         )
     )
 )
 
-;; ============================================
-;; Public Functions
-;; ============================================
+(define-private (update-daily-limit (address principal) (amount uint))
+    (let 
+        ((current-day (/ block-height u144))
+         (limit-data (default-to 
+            { tx-count: u0, total-amount: u0, last-tx-height: u0 } 
+            (map-get? daily-limits { address: address, day: current-day }))))
+        
+        (map-set daily-limits
+            { address: address, day: current-day }
+            {
+                tx-count: (+ (get tx-count limit-data) u1),
+                total-amount: (+ (get total-amount limit-data) amount),
+                last-tx-height: block-height
+            }
+        )
+    )
+)
 
-(define-public (process-payment
-    (recipient principal)
-    (amount uint)
-    (campaign-id uint)
-    (proof (buff 32)))
+(define-private (validate-pool (pool-id uint))
+    (match (map-get? revenue-pools { pool-id: pool-id })
+        pool (and
+            (is-eq (get status pool) "active")
+            (< block-height (get end-height pool))
+            (> (get remaining-amount pool) u0)
+        )
+        false
+    )
+)
+
+;; Publisher Account Management
+(define-private (initialize-publisher-account (publisher principal))
+    (map-set publisher-accounts
+        { publisher: publisher }
+        {
+            balance: u0,
+            total-earned: u0,
+            reward-points: u0,
+            tier: "bronze",
+            last-activity: block-height,
+            total-claims: u0,
+            pending-claims: u0,
+            status: "active"
+        }
+    )
+)
+
+(define-private (update-publisher-stats 
+    (publisher principal) 
+    (amount uint) 
+    (points uint))
     
-    (begin
-        (asserts! (validate-amount amount) ERR_INVALID_PARAMS)
-        
-        (let
-            ((distribution-id (generate-distribution-id))
-             (fee-amount (calculate-platform-fee amount)))
-            
-            (var-set treasury-balance (+ (var-get treasury-balance) fee-amount))
-            
-            (try! 
-                (map-set distributions
-                    { id: distribution-id }
-                    {
-                        recipient: recipient,
-                        amount: amount,
-                        campaign-id: campaign-id,
-                        block-height: block-height,
-                        status: "completed",
-                        fee-amount: fee-amount,
-                        proof: proof
-                    }
-                )
-            )
-            
-            (try! (update-publisher-balance recipient (- amount fee-amount)))
-            (try! (update-reward-points recipient (calculate-reward-points amount)))
-            
-            (var-set total-distributed (+ (var-get total-distributed) amount))
-            
-            (ok distribution-id)
+    (match (map-get? publisher-accounts { publisher: publisher })
+        existing-data
+        (map-set publisher-accounts
+            { publisher: publisher }
+            (merge existing-data {
+                balance: (+ (get balance existing-data) amount),
+                total-earned: (+ (get total-earned existing-data) amount),
+                reward-points: (+ (get reward-points existing-data) points),
+                last-activity: block-height
+            })
         )
+        (initialize-publisher-account publisher)
     )
-)
-
-(define-public (claim-payment (claim-id (buff 32)))
-    (let 
-        ((claim (unwrap! (map-get? payment-claims { id: claim-id }) ERR_NOT_FOUND)))
-        (begin
-            (asserts! (is-eq tx-sender (get publisher claim)) ERR_NOT_AUTHORIZED)
-            (asserts! (not (get claimed claim)) ERR_ALREADY_CLAIMED)
-            (asserts! (< block-height (get expiry-height claim)) ERR_NOT_ELIGIBLE)
-            
-            (try! 
-                (as-contract 
-                    (stx-transfer? (get amount claim) tx-sender (get publisher claim))
-                )
-            )
-            
-            (map-set payment-claims
-                { id: claim-id }
-                (merge claim { 
-                    claimed: true,
-                    status: "paid"
-                })
-            )
-            
-            (ok true)
-        )
-    )
-)
-
-(define-public (create-revenue-pool 
-    (initial-amount uint)
-    (duration uint)
-    (distribution-type (string-ascii 20)))
-    
-    (begin
-        (asserts! (> initial-amount u0) ERR_INVALID_PARAMS)
-        (asserts! (> duration u0) ERR_INVALID_PARAMS)
-        
-        (let
-            ((pool-id (+ (var-get pool-counter) u1)))
-            
-            (try! (stx-transfer? initial-amount tx-sender (as-contract tx-sender)))
-            
-            (try! 
-                (map-set revenue-pools
-                    { id: pool-id }
-                    {
-                        total-amount: initial-amount,
-                        participants: u0,
-                        share-price: u0,
-                        start-height: block-height,
-                        end-height: (+ block-height duration),
-                        status: "active",
-                        distribution-type: distribution-type
-                    }
-                )
-            )
-            
-            (var-set pool-counter pool-id)
-            
-            (ok pool-id)
-        )
-    )
-)
-
-;; ============================================
-;; Admin Functions
-;; ============================================
-
-(define-public (set-platform-fee (new-fee uint))
-    (begin
-        (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
-        (asserts! (<= new-fee u10) ERR_INVALID_PARAMS)
-        (ok (var-set platform-fee-percent new-fee))
-    )
-)
-
-(define-public (withdraw-treasury (amount uint))
-    (begin
-        (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
-        (asserts! (<= amount (var-get treasury-balance)) ERR_INSUFFICIENT_FUNDS)
-        
-        (try! (as-contract (stx-transfer? amount tx-sender CONTRACT_OWNER)))
-        (ok (var-set treasury-balance (- (var-get treasury-balance) amount)))
-    )
-)
-
-;; ============================================
-;; Read-Only Functions
-;; ============================================
-
-(define-read-only (get-distribution (distribution-id uint))
-    (ok (unwrap! (map-get? distributions { id: distribution-id }) ERR_NOT_FOUND))
-)
-
-(define-read-only (get-publisher-account (publisher principal))
-    (ok (unwrap! (map-get? publisher-accounts { publisher: publisher }) ERR_NOT_FOUND))
-)
-
-(define-read-only (get-revenue-pool (pool-id uint))
-    (ok (unwrap! (map-get? revenue-pools { id: pool-id }) ERR_NOT_FOUND))
-)
-
-(define-read-only (get-publisher-rewards (publisher principal))
-    (ok (unwrap! (map-get? reward-points { publisher: publisher }) ERR_NOT_FOUND))
 )
